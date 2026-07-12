@@ -1,0 +1,81 @@
+name: Patch s09 README
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/patch-s09-readme.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Insert Loading explanation below diagram
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          readme = Path('s09_memory/README.md')
+          anchor = '![Memory Overview](images/memory-overview.svg)\n'
+          block = r'''
+
+          > ## 四、图里的 Loading 不是“加载压缩结果”
+          >
+          > 这张图容易让人误解，因为画出来像这样：
+          >
+          > ```text
+          > messages[] → 压缩管线 → Loading → LLM
+          > ```
+          >
+          > 看起来好像：
+          >
+          > > `Loading` 在加载压缩后的 `messages[]`。
+          >
+          > 其实不是。
+          >
+          > 更准确的结构应该画成两条支路：
+          >
+          > ```text
+          >                          ┌──────────────────────┐
+          > messages[] → s08 压缩 ───┤                      │
+          >                          │  构造本次 LLM 请求   ├→ 主 LLM
+          > .memory/ → s09 Loading ──┤                      │
+          >                          └──────────────────────┘
+          > ```
+          >
+          > 两边分别负责：
+          >
+          > ```text
+          > messages[]：
+          > 当前会话发生过什么
+          >
+          > .memory/：
+          > 过去不同会话中值得长期保留什么
+          > ```
+          >
+          > `Loading` 不是压缩的一部分，而是：
+          >
+          > > **读取第二条数据源 `.memory/`，再和当前 `messages[]` 一起交给主模型。**
+          '''
+
+          text = readme.read_text(encoding='utf-8')
+          marker = '## 四、图里的 Loading 不是“加载压缩结果”'
+          if marker not in text:
+              if anchor not in text:
+                  raise SystemExit('diagram anchor not found')
+              text = text.replace(anchor, anchor + block + '\n', 1)
+              readme.write_text(text, encoding='utf-8')
+
+          Path('.github/workflows/patch-s09-readme.yml').unlink()
+          PY
+      - name: Commit README update
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add s09_memory/README.md .github/workflows/patch-s09-readme.yml
+          git commit -m 'docs: clarify s09 Loading flow below diagram'
+          git push
