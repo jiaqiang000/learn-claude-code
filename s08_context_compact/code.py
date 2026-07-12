@@ -262,16 +262,21 @@ def spawn_subagent(description: str) -> str:
 #  NEW in s08: Four-Layer Compaction Pipeline
 # ═══════════════════════════════════════════════════════════
 
+# 教学版使用字符数近似上下文大小，不依赖精确 tokenizer。
+# KEEP_RECENT 控制 L2 保留多少条完整工具结果；PERSIST_THRESHOLD 控制单条结果何时允许落盘。
 CONTEXT_LIMIT = 50000
 KEEP_RECENT = 3
 PERSIST_THRESHOLD = 30000
 
 def estimate_size(msgs): return len(str(msgs))
 
+# Anthropic SDK 返回的是对象，而历史消息经过持久化或手工构造后也可能是 dict，
+# 因此这里统一读取 block.type，供后续边界判断复用。
 def _block_type(block):
     return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
 
 
+# 判断 assistant 消息中是否发起了工具调用。压缩时不能只保留调用而丢掉对应结果。
 def _message_has_tool_use(msg):
     if msg.get("role") != "assistant":
         return False
@@ -281,6 +286,7 @@ def _message_has_tool_use(msg):
     return any(_block_type(block) == "tool_use" for block in content)
 
 
+# tool_result 在消息协议中由 user 角色承载；它通常紧跟在 assistant(tool_use) 后面。
 def _is_tool_result_message(msg):
     if msg.get("role") != "user":
         return False
@@ -293,12 +299,18 @@ def _is_tool_result_message(msg):
 
 # L1: snipCompact — trim middle messages
 def snip_compact(messages, max_messages=50):
+    # L1 只按消息数量裁剪：保留最初 3 条作为初始上下文，其余预算留给最近工作。
     if len(messages) <= max_messages: return messages
     keep_head, keep_tail = 3, max_messages - 3
     head_end, tail_start = keep_head, len(messages) - keep_tail
+
+    # 若头部切口恰好落在 tool_use 后面，就把紧随其后的 tool_result 一并留在头部，
+    # 避免生成“只有工具调用、没有工具结果”的非法对话结构。
     if head_end > 0 and _message_has_tool_use(messages[head_end - 1]):
         while head_end < len(messages) and _is_tool_result_message(messages[head_end]):
             head_end += 1
+
+    # 尾部切口反过来处理：若尾部第一条是 tool_result，则向前多保留它对应的 tool_use。
     if (tail_start > 0 and tail_start < len(messages)
             and _is_tool_result_message(messages[tail_start])
             and _message_has_tool_use(messages[tail_start - 1])):
@@ -311,6 +323,7 @@ def snip_compact(messages, max_messages=50):
 
 # L2: microCompact — old result placeholders
 def collect_tool_results(messages):
+    # 同一条 user 消息可能包含多个并行工具结果，因此记录消息、块和对象本身三个位置。
     blocks = []
     for mi, msg in enumerate(messages):
         if msg.get("role") != "user" or not isinstance(msg.get("content"), list): continue
@@ -320,6 +333,8 @@ def collect_tool_results(messages):
     return blocks
 
 def micro_compact(messages):
+    # 最近 3 条结果仍可能影响当前推理，保持原文；更旧且较长的结果原地替换为占位符。
+    # 这里只删除活跃上下文中的内容，不会像 L3 那样自动保存完整结果。
     tool_results = collect_tool_results(messages)
     if len(tool_results) <= KEEP_RECENT: return messages
     for _, _, block in tool_results[:-KEEP_RECENT]:
@@ -330,6 +345,7 @@ def micro_compact(messages):
 
 # L3: toolResultBudget — persist large results to disk
 def persist_large_output(tool_use_id, output):
+    # 单条结果足够大时才落盘；上下文中保留路径和前 2000 字符，让模型知道内容是什么、去哪里重读。
     if len(output) <= PERSIST_THRESHOLD: return output
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
@@ -337,11 +353,14 @@ def persist_large_output(tool_use_id, output):
     return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
 def tool_result_budget(messages, max_bytes=200_000):
+    # 预算只检查最后一条 user 消息，因为它承载的是本轮刚产生、尚未送回模型的工具结果。
     last = messages[-1] if messages else None
     if not last or last.get("role") != "user" or not isinstance(last.get("content"), list): return messages
     blocks = [(i, b) for i, b in enumerate(last["content"]) if isinstance(b, dict) and b.get("type") == "tool_result"]
     total = sum(len(str(b.get("content", ""))) for _, b in blocks)
     if total <= max_bytes: return messages
+
+    # 从最大的结果开始落盘，优先用最少的替换次数把本轮总量压回预算以内。
     ranked = sorted(blocks, key=lambda p: len(str(p[1].get("content", ""))), reverse=True)
     for _, block in ranked:
         if total <= max_bytes: break
@@ -349,12 +368,14 @@ def tool_result_budget(messages, max_bytes=200_000):
         if len(content) <= PERSIST_THRESHOLD: continue
         tid = block.get("tool_use_id", "unknown")
         block["content"] = persist_large_output(tid, content)
+        # 替换后重新计算总量，因为占位标记和预览本身仍占上下文。
         total = sum(len(str(b.get("content", ""))) for _, b in blocks)
     return messages
 
 
 # L4: autoCompact — LLM full summary
 def write_transcript(messages):
+    # L4 会用摘要替换活跃历史，因此先把原始消息写成 JSONL，至少保留可审计、可人工恢复的记录。
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with path.open("w") as f:
@@ -362,6 +383,7 @@ def write_transcript(messages):
     return path
 
 def summarize_history(messages):
+    # 前三层只是机械裁剪；L4 额外调用一次模型，语义化保留目标、发现、文件和未完成工作。
     conversation = json.dumps(messages, default=str)[:80000]
     prompt = ("Summarize this coding-agent conversation so work can continue.\n"
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
@@ -373,6 +395,7 @@ def summarize_history(messages):
         if getattr(block, "type", None) == "text").strip() or "(empty summary)"
 
 def compact_history(messages):
+    # 主动/自动压缩会把全部旧消息替换成一条摘要；教学版不自动恢复最近文件等额外上下文。
     transcript_path = write_transcript(messages)
     print(f"[transcript saved: {transcript_path}]")
     summary = summarize_history(messages)
@@ -381,8 +404,11 @@ def compact_history(messages):
 
 # Emergency: reactiveCompact — on API error
 def reactive_compact(messages):
+    # reactive_compact 是 API 已经拒绝请求后的兜底：总结较早历史，但尽量保留最后 5 条消息原文。
     transcript = write_transcript(messages)
     tail_start = max(0, len(messages) - 5)
+
+    # 尾部仍需满足工具协议边界；若从 tool_result 开始，就连同前一条 tool_use 一起保留。
     if (tail_start > 0 and tail_start < len(messages)
             and _is_tool_result_message(messages[tail_start])
             and _message_has_tool_use(messages[tail_start - 1])):
@@ -417,6 +443,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
 ]
 
+# compact 没有放进普通 handler：它需要直接改写整个 messages 历史，必须在 agent_loop 中单独处理。
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
@@ -454,21 +481,24 @@ MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 def agent_loop(messages: list):
     reactive_retries = 0
     while True:
-        # s08 change: three preprocessors (0 API calls, cheap first)
-        # Order matches CC source: budget → snip → micro
+        # 三个预处理器都只做本地结构/文本操作，不产生额外 API 费用。
+        # 必须先 budget：若 micro 先把旧大结果替换掉，完整内容就来不及落盘保存。
+        # 使用切片赋值而不是 messages = ...，是为了保持外部 history 对同一个 list 对象的引用。
         messages[:] = tool_result_budget(messages)    # L3: persist large results first
         messages[:] = snip_compact(messages)          # L1: trim middle
         messages[:] = micro_compact(messages)         # L2: old result placeholders
 
-        # s08 change: tokens still over threshold → LLM summary (1 API call)
+        # 机械压缩后仍超过阈值，才支付一次 LLM 调用生成全量语义摘要。
         if estimate_size(messages) > CONTEXT_LIMIT:
             print("[auto compact]")
             messages[:] = compact_history(messages)
 
         try:
             response = client.messages.create(model=MODEL, system=SYSTEM, messages=messages, tools=TOOLS, max_tokens=8000)
+            # 一旦 API 调用成功，说明当前上下文已可接受，下一轮重新计算应急重试次数。
             reactive_retries = 0  # reset on successful API call
         except Exception as e:
+            # reactive 只处理“提示词过长”，且默认仅重试一次，防止压缩失败后无限消耗 API。
             if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
                 print("[reactive compact]")
                 messages[:] = reactive_compact(messages)
@@ -484,7 +514,8 @@ def agent_loop(messages: list):
             if block.type != "tool_use": continue
             print(f"\033[36m> {block.name}\033[0m")
 
-            # s08: compact tool triggers compact_history, not a no-op string
+            # compact 是模型主动发起的上下文管理动作，不走普通工具 handler。
+            # 压缩后立即结束本轮工具遍历，下一轮将基于摘要后的新上下文重新调用模型。
             if block.name == "compact":
                 messages[:] = compact_history(messages)
                 results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -502,10 +533,10 @@ def agent_loop(messages: list):
             print(str(output)[:200])
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         else:
-            # normal path: no compact was called
+            # Python 的 for...else 仅在循环没有被 break 时进入：说明本轮没有调用 compact，正常回传全部工具结果。
             messages.append({"role": "user", "content": results})
             continue
-        # compact was called: results already appended above
+        # 只有 compact 分支会 break 到这里；它已经自行追加 tool_result，直接开始下一轮。
         continue
 
 
