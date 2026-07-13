@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# ═════════════════════════════════════════════════════════════════════════════
+# s15 章节导读：从“临时子 Agent”走向“可持续通信的 Agent Team”
+# ═════════════════════════════════════════════════════════════════════════════
+# 本章目标不是改写最内层的 Agent Loop，而是在它外面补齐团队协作所需的
+# “队友生命周期 + 异步邮箱 + Lead 唤醒”三件套。核心闭环如下：
+#
+#   Lead 调用 spawn_teammate
+#     → 后台 daemon 线程创建一套独立 messages / tools
+#     → 队友通过 MessageBus 把结果追加到 lead.jsonl
+#     → inbox_poller 只检测“是否有信”，并向 events 投递 wake
+#     → 主线程消费邮箱，把消息作为 user turn 注入 history
+#     → 原有 agent_loop 被再次调用，Lead 因而真正“感知并处理”队友结果
+#
+# s12 的任务图、s13 的后台工具和 s14 的 cron 仍保留给 Lead；本章的主要新增
+# 都集中在 MessageBus、spawn_teammate_thread 以及文件末尾的事件合流逻辑。
+# 教学版刻意保留三项边界：邮箱没有文件锁、队友最多运行 10 轮、所有线程共享
+# WORKDIR；关机握手会在 s16 引入，独立 worktree 则要到 s18 才解决。
+
 """
 s15: Agent Teams — MessageBus + spawn_teammate_thread + inbox injection.
 
@@ -25,6 +43,9 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
 
+# threading 同时承载后台命令、cron、队友和两个输入监听器；queue 则负责把
+# 这些异步来源重新串行化，避免多个线程同时修改 Lead 的 history 或调用模型。
+
 try:
     import readline
     readline.parse_and_bind('set bind-tty-special-chars off')
@@ -44,7 +65,12 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12, synced) ──
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s12-s14 (unchanged): 文件持久化的任务图
+# ═════════════════════════════════════════════════════════════════════════════
+# 每个任务仍单独落盘到 .tasks。blockedBy 决定依赖是否满足，owner/status 记录
+# 认领与生命周期。本章只沿用这套基础设施；教学版队友的精简工具集中并未开放
+# Task 工具，因此这里主要仍由 Lead 使用。
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -66,6 +92,7 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    # 时间戳负责大体有序，四位随机数降低同一秒创建多个任务时的 ID 碰撞概率。
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -99,6 +126,7 @@ def can_start(task_id: str) -> bool:
     """Check if all blockedBy dependencies are completed.
     Missing dependencies are treated as blocked."""
     task = load_task(task_id)
+    # 依赖文件不存在与依赖尚未完成都算 blocked，避免任务“带病启动”。
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
             return False
@@ -128,6 +156,7 @@ def complete_task(task_id: str) -> str:
         return f"Task {task_id} is {task.status}, cannot complete"
     task.status = "completed"
     save_task(task)
+    # 完成后重新扫描 pending 任务，把本次状态变化解锁的下游任务反馈给模型。
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
     print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
@@ -138,7 +167,11 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Prompt Assembly (from s10, synced) ──
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s10-s14 (unchanged): Lead 的动态 System Prompt 组装与缓存
+# ═════════════════════════════════════════════════════════════════════════════
+# 组装器本身没有因团队机制而改变；变化体现在 tools 文本新增了三种团队工具。
+# 队友不会复用这份 prompt，而会在 spawn_teammate_thread 中获得自己的角色说明。
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -166,6 +199,7 @@ _last_context_key, _last_prompt = None, None
 
 def get_system_prompt(context: dict) -> str:
     global _last_context_key, _last_prompt
+    # 用完整 context 作为缓存键：工作区、工具或记忆没变时复用同一 prompt。
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
         return _last_prompt
@@ -174,17 +208,22 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s02-s14 (unchanged): Lead 的基础文件、Shell 与任务工具
+# ═════════════════════════════════════════════════════════════════════════════
+# 这些 handler 继续负责实际执行；后面的工具 schema 只负责告诉模型“能怎么调”。
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
+    # resolve 后再检查父目录，防止 ../ 或符号链接把读写范围带出工作区。
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
+    # run_in_background 只是模型传入的调度意图，是否开线程由 agent_loop 统一判断；
+    # 真正执行 Bash 的 handler 保持同步，因而也能被队友的精简循环直接复用。
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -214,7 +253,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-# Task tools
+# Task 工具的这一层 wrapper 负责把内部对象转换成适合回送给模型的字符串。
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -254,7 +293,12 @@ def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
 
 
-# ── Background Tasks (from s13, synced) ──
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s13-s14 (unchanged): 后台工具执行与完成通知
+# ═════════════════════════════════════════════════════════════════════════════
+# 慢命令在线程中执行，完成结果先暂存在共享字典，再包装成 task_notification。
+# s15 的新衔接点是：文件末尾的 inbox_poller 也观察 has_pending_background()，
+# 让“队友来信”和“后台任务完成”共用同一条 wake → 新 turn 通道。
 
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}
@@ -282,6 +326,8 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
 
 def execute_tool(block) -> str:
     """Execute a tool call block, return output."""
+    # 这是 Lead 的统一 dispatch map。s15 的三个团队 handler 也挂到这里，
+    # 因此主循环无需为每个新增工具增加一套 if/else。
     handler = {
         "bash": run_bash, "read_file": run_read, "write_file": run_write,
         "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -305,6 +351,7 @@ def start_background_task(block) -> str:
     cmd = block.input.get("command", block.name)
 
     def worker():
+        # worker 只写共享状态，不直接改 messages；模型上下文统一由主线程更新。
         result = execute_tool(block)
         with background_lock:
             background_tasks[bg_id]["status"] = "completed"
@@ -329,6 +376,7 @@ def collect_background_results() -> list[str]:
     notifications = []
     for bg_id in ready_ids:
         with background_lock:
+            # pop 表示通知只交付一次；后续重复 wake 不会再次注入同一结果。
             task = background_tasks.pop(bg_id)
             output = background_results.pop(bg_id, "")
         summary = output[:200] if len(output) > 200 else output
@@ -348,10 +396,16 @@ def has_pending_background() -> bool:
     """Non-destructive: True if any background task has completed and is
     waiting to be collected. The inbox poller uses this in its wake condition."""
     with background_lock:
+        # 与 collect 不同，这里只探测不消费，适合给轮询线程当“门铃”。
         return any(t["status"] == "completed" for t in background_tasks.values())
 
 
-# ── Cron Scheduler (from s14, synced) ──
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s14 (unchanged): 持久化 Cron 调度器
+# ═════════════════════════════════════════════════════════════════════════════
+# cron 线程只负责按时把 CronJob 放进 cron_queue；agent_loop 被唤起后才会消费并
+# 注入 messages。教学版 s15 的新 poller 没有监听 cron_queue，所以单独的 cron
+# 到点并不会像队友来信那样主动唤醒 Lead，仍需一次用户或其他异步事件触发循环。
 
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
@@ -530,7 +584,7 @@ def cron_scheduler_loop():
     while True:
         time.sleep(1)
         now = datetime.now()
-        # Date-aware marker prevents daily jobs from skipping on day 2+
+        # marker 带日期且精确到分钟：既防止同一分钟内重复触发，也不影响次日再跑。
         minute_marker = now.strftime("%Y-%m-%d %H:%M")
         with cron_lock:
             for job in list(scheduled_jobs.values()):
@@ -557,7 +611,7 @@ def consume_cron_queue() -> list[CronJob]:
     return fired
 
 
-# Load durable jobs on startup, then start scheduler thread
+# 启动时先恢复 durable job，再启动常驻调度线程。
 load_durable_jobs()
 threading.Thread(target=cron_scheduler_loop, daemon=True).start()
 print("  \033[35m[cron] scheduler thread started\033[0m")
@@ -591,9 +645,12 @@ def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
 
 
-# ── MessageBus (s15 new) ──
-# Teaching version uses simple file append + unlink.
-# Real CC uses proper-lockfile for concurrent write safety.
+# ═════════════════════════════════════════════════════════════════════════════
+# NEW in s15: 文件邮箱 MessageBus —— 把跨 Agent 通信变成可观察的持久状态
+# ═════════════════════════════════════════════════════════════════════════════
+# 这里的 “Bus” 不是一个常驻中央服务：发送方直接 append 收件人的 .jsonl 文件，
+# 接收方再自行读取。选择文件而非内存 Queue，使不同线程都能通信，也便于读者在
+# .mailboxes 目录直接观察消息；代价是教学实现没有文件锁，不能保证生产级并发安全。
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -606,9 +663,11 @@ class MessageBus:
 
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = "message"):
+        # from/to/type/ts 一起落盘，使普通消息和最终 result 能沿用同一传输格式。
         msg = {"from": from_agent, "to": to_agent,
                "content": content, "type": msg_type,
                "ts": time.time()}
+        # “写给谁”就追加到“谁的文件”；没有单独的路由线程参与转发。
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
@@ -616,12 +675,14 @@ class MessageBus:
               f"{content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
+        # 消费语义是 read → unlink：返回列表的同时清空这一批消息。
+        # 因为没有锁，send 恰好发生在读取与删除之间时存在丢信竞态，这是教学取舍。
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
         msgs = [json.loads(line) for line in inbox.read_text().splitlines()
                 if line.strip()]
-        inbox.unlink()  # consume: read + delete
+        inbox.unlink()  # 删除整个邮箱文件；下一封消息会重新创建它
         return msgs
 
     def peek(self, agent: str) -> bool:
@@ -629,31 +690,42 @@ class MessageBus:
         The Lead's inbox poller uses this to decide whether to wake a turn
         without consuming the mailbox."""
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
+        # poller 只按响“门铃”，真正取信必须留给主线程，避免检测动作提前消费内容。
         return inbox.exists() and inbox.stat().st_size > 0
 
 
 BUS = MessageBus()
 
-# Track spawned teammates
+# 这是进程内的轻量活动表：用于防止重名和显示完成状态，不是持久化 Team Config。
 active_teammates: dict[str, bool] = {}
 
 
-# ── Teammate Thread (s15 new) ──
+# ═════════════════════════════════════════════════════════════════════════════
+# NEW in s15: spawn_teammate_thread —— 每个队友拥有独立上下文的多轮 Agent
+# ═════════════════════════════════════════════════════════════════════════════
+# 队友不是在 Lead 的 messages 上继续推理，而是在独立 daemon 线程中创建自己的
+# system、messages、tools 和循环。线程共享文件系统，但模型上下文彼此隔离；需要
+# 共享的信息必须显式经过 MessageBus，这正是“队友”区别于同一上下文内分支的关键。
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     """Spawn a teammate agent in a background thread.
     Teaching version: max 10 rounds per teammate.
     Real CC: teammates use idle loop (wait for inbox, work, repeat)
     until shutdown_request."""
+    # 同名队友还在活动时拒绝重复 spawn；教学版没有加锁，默认由 Lead 串行调用。
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
+    # role 决定队友身份，prompt 是它收到的第一项具体任务；两者用途不同。
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
               f"Send results via send_message to 'lead'.")
 
     def run():
+        # 新建 messages 意味着队友看不到 Lead 的完整历史，只知道派发给自己的 prompt。
         messages = [{"role": "user", "content": prompt}]
+        # 队友工具集刻意缩小：能操作工作区、能发消息，但不能继续 spawn 队友，
+        # 也没有教学版 Lead 的 task / cron / 后台调度能力。
         sub_tools = [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object",
@@ -677,16 +749,21 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         ]
         sub_handlers = {
             "bash": run_bash, "read_file": run_read, "write_file": run_write,
+            # sender 固定使用当前闭包中的 name，模型只能指定接收者，不能伪造来源。
             "send_message": lambda to, content: (BUS.send(name, to, content),
                                                   "Sent")[1],
         }
 
+        # 一次迭代对应一次模型响应，而不是一个 OS 时间片。最多 10 轮只是教学版
+        # 的硬上限；如果模型不再请求工具会提前退出，并不会进入可再次唤醒的 idle loop。
         for _ in range(10):
+            # 队友每轮调用模型前先消费自己的邮箱，使 Lead 的后续指令进入其上下文。
             inbox = BUS.read_inbox(name)
             if inbox:
                 messages.append({"role": "user",
                                  "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
             try:
+                # [-20:] 只限制传入的消息条目数，不等价于精确的 token 预算。
                 response = client.messages.create(
                     model=MODEL, system=system, messages=messages[-20:],
                     tools=sub_tools, max_tokens=8000)
@@ -696,6 +773,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             if response.stop_reason != "tool_use":
                 break
             results = []
+            # 与 Lead 一样：先执行所有 tool_use，再把对应 tool_result 作为 user 消息
+            # 回填；这样下一轮模型才能看到本轮行动的真实结果。
             for block in response.content:
                 if block.type == "tool_use":
                     handler = sub_handlers.get(block.name)
@@ -705,7 +784,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                     "content": str(output)})
             messages.append({"role": "user", "content": results})
 
-        # Send final summary to Lead
+        # 无论是正常结束、达到 10 轮还是 API 异常，都会尝试选取最近一段文本作为
+        # summary；完全没有文本时使用 "Done."，保证 Lead 最终仍能收到一个结果事件。
         summary = "Done."
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
@@ -716,28 +796,39 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 else:
                     continue
                 break
+        # 先投递结果、再移出活动表。即使 registry 已清空，邮箱文件仍能独立存活；
+        # 因而 Lead 的 poller 绝不能只用 active_teammates 判断是否还有结果。
         BUS.send(name, "lead", summary, "result")
         active_teammates.pop(name, None)
         print(f"  \033[32m[teammate] {name} finished\033[0m")
 
+    # 先登记再启动，避免线程刚运行时外部仍认为该名字可重复创建。
     active_teammates[name] = True
+    # daemon=True 表示主进程退出时不会等待队友收尾；s16 才会引入正式关机握手。
     threading.Thread(target=run, daemon=True).start()
     print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
     return f"Teammate '{name}' spawned as {role}"
 
 
-# ── Team Tool Handlers (s15 new) ──
+# ═════════════════════════════════════════════════════════════════════════════
+# NEW in s15: 团队工具 Handler —— 把模型调用连接到线程与邮箱
+# ═════════════════════════════════════════════════════════════════════════════
+# spawn_teammate 管生命周期，send_message 负责 Lead → 队友，check_inbox 则让
+# Lead 可以主动取信。后两者都复用 MessageBus，但发送者身份由 handler 固定。
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
 
 
 def run_send_message(to: str, content: str) -> str:
+    # Lead 无需也不能从 tool input 自报身份，避免把消息来源交给模型随意填写。
     BUS.send("lead", to, content)
     return f"Sent to {to}"
 
 
 def run_check_inbox() -> str:
+    # 这是主动查询路径，同样会消费邮箱；结果会作为 tool_result 回到当前模型轮次。
+    # 文件末尾的自动 poller 则是不经模型主动调用的被动唤醒路径。
     msgs = BUS.read_inbox("lead")
     if not msgs:
         return "(inbox empty)"
@@ -747,7 +838,10 @@ def run_check_inbox() -> str:
     return "\n".join(lines)
 
 
-# ── Tool Definitions ──
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s02-s14 (unchanged): Lead 原有工具 schema；s15 在同一列表追加团队入口
+# ═════════════════════════════════════════════════════════════════════════════
+# schema 是给模型看的能力说明；名称必须与 execute_tool 中的 handler key 对齐。
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -816,6 +910,11 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"job_id": {"type": "string"}},
                       "required": ["job_id"]}},
+    # ─────────────────────────────────────────────────────────────────────────
+    # NEW in s15: Lead 可见的三个团队协作工具
+    # ─────────────────────────────────────────────────────────────────────────
+    # spawn 创建独立队友，send 投递消息，check 主动消费 Lead 邮箱；自动收信机制
+    # 不属于工具，而位于 __main__ 的 inbox_poller + events 主循环中。
     {"name": "spawn_teammate",
      "description": "Spawn a teammate agent in a background thread.",
      "input_schema": {"type": "object",
@@ -837,7 +936,11 @@ TOOLS = [
 ]
 
 
-# ── Context ──
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s09-s14 (unchanged): 从运行时状态派生 Lead 的 Prompt Context
+# ═════════════════════════════════════════════════════════════════════════════
+# 函数结构未变，但 enabled_tools 会自然包含 s15 新增 schema；这体现了“能力从
+# 注册表派生”，不需要再为团队机制复制一套 prompt 组装逻辑。
 
 def update_context(context: dict, messages: list) -> dict:
     """Derive context from real state."""
@@ -853,15 +956,17 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop ──
-# Teaching code keeps a basic agent loop. S11's full error recovery is omitted.
-# Cron queue is consumed when agent_loop is called; real CC auto-wakes via
-# queue processor (useQueueProcessor.ts) when items arrive.
+# ═════════════════════════════════════════════════════════════════════════════
+# FROM s01-s14 (unchanged): Lead 的基础 Agent Loop
+# ═════════════════════════════════════════════════════════════════════════════
+# s15 没把团队调度硬编码进这条循环：它仍只做“调用模型 → 执行工具 → 回填结果”。
+# 队友消息是在外层先变成普通 user message，再复用同一个 agent_loop；这使新增的
+# 异步来源不会污染最核心的工具循环。教学版也继续省略 s11 的完整错误恢复。
 
 def agent_loop(messages: list, context: dict):
     system = get_system_prompt(context)
     while True:
-        # Consume fired cron jobs → inject as messages
+        # 每次进入模型前顺手消费已触发 cron；这里是注入点，不是 cron 的唤醒源。
         fired = consume_cron_queue()
         for job in fired:
             messages.append({"role": "user",
@@ -889,6 +994,7 @@ def agent_loop(messages: list, context: dict):
             print(f"\033[36m> {block.name}\033[0m")
 
             if should_run_background(block.name, block.input):
+                # 先立即回告“已启动”，真实完成结果稍后通过统一 wake 通道进入新 turn。
                 bg_id = start_background_task(block)
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
@@ -901,7 +1007,8 @@ def agent_loop(messages: list, context: dict):
                                 "tool_use_id": block.id,
                                 "content": output})
 
-        # Merge background tool results + notifications into one user message
+        # 同步 tool_result 与此刻已经完成的后台通知合并成一个 user 消息，保持
+        # Anthropic tool_use/tool_result 的轮次配对关系。
         user_content = list(results)
         bg_notifications = collect_background_results()
         if bg_notifications:
@@ -912,17 +1019,25 @@ def agent_loop(messages: list, context: dict):
         system = get_system_prompt(context)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# NEW in s15: 异步事件合流、Lead 自动唤醒与 inbox 注入
+# ═════════════════════════════════════════════════════════════════════════════
+# 这是本章闭环的最后一段。input_reader 和 inbox_poller 可以并行等待，但都只把
+# 事件放入线程安全 Queue；真正修改 history、消费邮箱和调用 agent_loop 的始终是
+# 下方唯一的主线程。因此“后台并发生产事件”和“前台串行推进对话”可以同时成立。
+
 if __name__ == "__main__":
     print("s15: agent teams")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
     context = update_context({}, [])
 
-    # input() and a 1s poller (teammate inbox or background results) feed one
-    # event queue (issues #291, #46).
+    # input() 会阻塞当前线程，所以把它移入独立 reader；否则 Lead 等用户敲键盘时，
+    # 即使队友已经写完邮箱，主流程也没有机会处理。两类来源最终汇入同一个队列。
     events = queue.Queue()
 
     def input_reader():
+        # 此线程只采集终端输入，不碰 history；quit/user 也被编码成普通事件。
         while True:
             try:
                 line = input("\033[36ms15 >> \033[0m")
@@ -932,20 +1047,21 @@ if __name__ == "__main__":
             events.put(("user", line))
 
     def inbox_poller():
-        # Poll ~1s and wake the Lead when async results are ready: teammate
-        # inbox messages or completed background tasks. Don't gate on
-        # active_teammates: a teammate sends its result and then removes itself,
-        # so the final message can outlive its registry entry.
+        # 每秒只做非破坏性探测：队友邮箱或后台结果任一就绪，就投递 wake。
+        # 不能用 active_teammates 作为前置条件，因为队友是“先发最终结果、再注销”，
+        # 它的 inbox 消息可能比活动表记录活得更久。
         while True:
             time.sleep(1)
             if BUS.peek("lead") or has_pending_background():
                 events.put(("wake", None))
 
+    # 两个生产者可以并发等待；消费 events 的仍只有下面一个主循环。
     threading.Thread(target=input_reader, daemon=True).start()
     threading.Thread(target=inbox_poller, daemon=True).start()
 
     had_teammates = False
     while True:
+        # 没有用户输入也没有异步结果时在这里阻塞，不会空转消耗 CPU。
         kind, payload = events.get()
         if kind == "quit":
             break
@@ -954,6 +1070,7 @@ if __name__ == "__main__":
                 break
             history.append({"role": "user", "content": payload})
         else:  # "wake": teammate inbox or background results are ready
+            # wake 只是“可能有新结果”的信号；内容必须在主线程此刻正式消费。
             parts = []
             inbox = BUS.read_inbox("lead")
             if inbox:
@@ -962,12 +1079,16 @@ if __name__ == "__main__":
             bg = collect_background_results()
             parts.extend(bg)
             if not parts:
-                continue  # already drained by an earlier wake (idempotent)
+                # 轮询期间可能堆入多个 wake；第一条已取空资源，后续空 wake 直接跳过，
+                # 从而让“至少一次唤醒”表现为“结果至多注入一次”。
+                continue
+            # 这是 Lead “感知”异步结果的关键一步：邮箱/后台结果不直接调用模型，
+            # 而是先伪装成一个正常 user turn 进入 history，再由统一 agent_loop 处理。
             history.append({"role": "user", "content": "\n".join(parts)})
             print(f"\n\033[33m[wake: {len(inbox)} inbox + {len(bg)} background "
                   f"-> new turn]\033[0m")
 
-        # One turn for whichever source woke us.
+        # 不论来源是人类输入还是异步 wake，最终都复用同一条 Lead 推理路径。
         agent_loop(history, context)
         context = update_context(context, history)
         for block in history[-1]["content"]:
@@ -976,7 +1097,8 @@ if __name__ == "__main__":
             elif isinstance(block, dict) and block.get("type") == "text":
                 print(block.get("text", ""))
 
-        # Announce once when every teammate has finished and its output drained.
+        # “线程已退出”还不等于“协作已收尾”：只有活动表为空，且最后一封邮件与
+        # 后台通知也已被消费，才打印一次 all teammates done，避免过早宣告完成。
         if active_teammates:
             had_teammates = True
         elif had_teammates and not BUS.peek("lead") and not has_pending_background():
