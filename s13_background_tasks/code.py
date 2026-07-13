@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# s13 目标：让耗时工具不再阻塞 Agent 主循环，并在执行完成后把结果作为独立通知送回对话。
+# 相比 s12，任务管理、prompt 组装和普通工具仍沿用原有实现；本章只改变“工具怎样执行、结果怎样回来”。
+# 整体流程：判断是否转后台 → 创建线程并立刻返回占位 tool_result → 主循环继续工作
+#          → 后台完成后收集结果 → 以 <task_notification> 文本块注入后续消息。
 """
 s13: Background Tasks — thread-based async execution + notification injection.
 
@@ -21,6 +25,7 @@ tasks. S11's full error recovery (RecoveryState, backoff, escalation,
 reactive compact, fallback model) is omitted.
 """
 
+# threading 是本章新增机制的基础；其余模块继续服务于前面章节已有的任务、工具和上下文逻辑。
 import os, subprocess, json, time, random, threading
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -44,7 +49,10 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12, synced) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s12 (unchanged): 简化任务系统与依赖状态流转
+# ═══════════════════════════════════════════════════════════
+# 任务仍以 JSON 文件持久化；本章的“后台任务”是另一套运行时状态，不会写入这里的 .tasks 目录。
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -98,6 +106,7 @@ def get_task(task_id: str) -> str:
 def can_start(task_id: str) -> bool:
     """Check if all blockedBy dependencies are completed.
     Missing dependencies are treated as blocked."""
+    # blockedBy 描述任务之间的业务依赖，与后台线程是否执行完毕没有直接关系。
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -138,7 +147,9 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Prompt Assembly (from s10, synced) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s10-s12 (unchanged): System Prompt 分段组装与缓存
+# ═══════════════════════════════════════════════════════════
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -164,6 +175,7 @@ _last_context_key, _last_prompt = None, None
 
 def get_system_prompt(context: dict) -> str:
     global _last_context_key, _last_prompt
+    # 上下文没有变化时复用上次 prompt，避免重复完成相同的字符串组装。
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
         return _last_prompt
@@ -172,9 +184,12 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ═══════════════════════════════════════════════════════════
+# FROM s02-s12 (unchanged): 通用工具实现与 Task 工具适配层
+# ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
+    # 所有文件路径都必须留在 WORKDIR 内，防止 read/write 工具越出工作区。
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -182,7 +197,8 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
+    # NEW in s13：此参数只用来兼容工具 schema；是否转后台由 agent_loop 在调用本函数前决定。
+    # 因此后台 worker 进入这里后，仍会同步等待 subprocess 完成，只是等待发生在线程里而非主循环里。
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -252,6 +268,11 @@ def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
 
 
+# ═══════════════════════════════════════════════════════════
+# NEW in s13: Bash 暴露显式后台开关
+# ═══════════════════════════════════════════════════════════
+# 只有 bash 新增 run_in_background；其他工具的 schema 和处理函数继续沿用前章。
+# 模型通过这个字段表达执行意图，真正的线程调度仍由后面的 should_run_background + agent_loop 完成。
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
@@ -299,6 +320,7 @@ TOOLS = [
                       "required": ["task_id"]}},
 ]
 
+# 工具名到 Python 函数的统一映射同时服务于前台执行和后台 worker，避免维护两套执行逻辑。
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -307,8 +329,12 @@ TOOL_HANDLERS = {
 }
 
 
-# ── Background Tasks (s13 new) ──
+# ═══════════════════════════════════════════════════════════
+# NEW in s13: 后台任务判定、生命周期追踪与完成通知
+# ═══════════════════════════════════════════════════════════
 
+# background_tasks 保存运行状态和命令元数据，background_results 单独保存最终输出。
+# worker 线程负责写入，Agent 主循环负责读取和删除，因此共享状态必须由同一把锁保护。
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}   # bg_id → {tool_use_id, command, status}
 background_results: dict[str, str] = {}   # bg_id → output
@@ -317,6 +343,7 @@ background_lock = threading.Lock()
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
     """Fallback heuristic: commands likely to take > 30s."""
+    # 教学版只允许 bash 进入该兜底判断；关键词只能估计耗时，可能出现误判或漏判。
     if tool_name != "bash":
         return False
     cmd = tool_input.get("command", "").lower()
@@ -328,6 +355,7 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
     """Model explicit request takes priority; fallback to heuristic."""
+    # 显式传入 true 时直接转后台；传入 false 或未传时，代码仍会继续使用慢命令启发式兜底。
     if tool_input.get("run_in_background"):
         return True
     return is_slow_operation(tool_name, tool_input)
@@ -335,6 +363,7 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
 
 def execute_tool(block) -> str:
     """Execute a tool call block, return output."""
+    # 前台分支和后台线程最终都汇入这里，差别仅在“由哪个执行流等待结果”。
     handler = TOOL_HANDLERS.get(block.name)
     if handler:
         return handler(**block.input)
@@ -344,22 +373,26 @@ def execute_tool(block) -> str:
 def start_background_task(block) -> str:
     """Run tool in a daemon thread. Returns background task ID."""
     global _bg_counter
+    # bg_id 是后台任务自己的生命周期标识，不等同于 Messages API 为本次工具调用生成的 block.id。
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
     cmd = block.input.get("command", block.name)
 
     def worker():
         result = execute_tool(block)
+        # 先写 completed 状态和结果，主循环下一次收集时就能把二者作为一个整体取走。
         with background_lock:
             background_tasks[bg_id]["status"] = "completed"
             background_results[bg_id] = result
 
+    # 必须先登记 running 状态再启动线程，否则极快的命令可能先完成并访问一个尚不存在的记录。
     with background_lock:
         background_tasks[bg_id] = {
             "tool_use_id": block.id,
             "command": cmd,
             "status": "running",
         }
+    # daemon 线程不会阻止 Python 进程退出；教学版退出 Agent 时也不会等待后台命令收尾。
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
@@ -368,6 +401,7 @@ def start_background_task(block) -> str:
 
 def collect_background_results() -> list[str]:
     """Collect completed background results as task_notification messages."""
+    # 先在锁内拍下已完成 ID，再逐个 pop；被移除的任务不会在后续轮次重复通知。
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
@@ -377,6 +411,8 @@ def collect_background_results() -> list[str]:
             task = background_tasks.pop(bg_id)
             output = background_results.pop(bg_id, "")
         summary = output[:200] if len(output) > 200 else output
+        # 原 tool_use 已由“任务已启动”的占位 tool_result 完成配对；真实结果是后续发生的独立事件，
+        # 所以这里用普通文本形式的 task_notification，而不是再伪造第二个 tool_result。
         notifications.append(
             f"<task_notification>\n"
             f"  <task_id>{bg_id}</task_id>\n"
@@ -389,7 +425,9 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-# ── Context ──
+# ═══════════════════════════════════════════════════════════
+# FROM s09-s12 (unchanged): 从工作区状态刷新动态上下文
+# ═══════════════════════════════════════════════════════════
 
 def update_context(context: dict, messages: list) -> dict:
     """Derive context from real state."""
@@ -405,11 +443,14 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop (simplified, focused on background tasks) ──
+# ═══════════════════════════════════════════════════════════
+# NEW in s13: Agent Loop 中的前后台分流与通知注入
+# ═══════════════════════════════════════════════════════════
 
 def agent_loop(messages: list, context: dict):
     system = get_system_prompt(context)
     while True:
+        # 主模型生成期间，已经启动的 worker 线程仍可继续执行，不需要等待本轮 API 调用结束。
         try:
             response = client.messages.create(
                 model=MODEL, system=system, messages=messages,
@@ -421,10 +462,12 @@ def agent_loop(messages: list, context: dict):
             return
 
         messages.append({"role": "assistant", "content": response.content})
+        # 教学版没有独立通知队列来主动唤醒循环；模型不再调用工具时，本次 agent_loop 就结束。
         if response.stop_reason != "tool_use":
             return
 
         results = []
+        # Messages API 要求本轮每个 tool_use 都在紧随其后的 user 消息中得到一个 tool_result。
         for block in response.content:
             if block.type != "tool_use":
                 continue
@@ -432,19 +475,22 @@ def agent_loop(messages: list, context: dict):
 
             if should_run_background(block.name, block.input):
                 bg_id = start_background_task(block)
+                # 这里先返回“已启动”占位结果以完成协议配对，使模型无需等待真实命令输出即可继续推理。
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": f"[Background task {bg_id} started] "
                                            f"Command: {block.input.get('command', '')}. "
                                            f"Result will be available when complete."})
             else:
+                # 快操作仍在主循环同步执行，并直接把真实输出作为本次 tool_result 返回。
                 output = execute_tool(block)
                 print(str(output)[:300])
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": output})
 
-        # Inject tool results + background notifications in one user message
+        # 本教学版在“工具轮末尾”轮询一次完成状态：新 tool_result 与已完成通知合并进同一条 user 消息。
+        # collect 会消费掉已通知任务；仍处于 running 的任务则留待后续工具轮继续检查。
         user_content = list(results)
         bg_notifications = collect_background_results()
         if bg_notifications:
@@ -457,6 +503,9 @@ def agent_loop(messages: list, context: dict):
         system = get_system_prompt(context)
 
 
+# ═══════════════════════════════════════════════════════════
+# FROM s01-s12 (unchanged): 命令行交互入口与跨轮对话历史
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("s13: background tasks")
     print("Enter a question, press Enter to send. Type q to quit.\n")
