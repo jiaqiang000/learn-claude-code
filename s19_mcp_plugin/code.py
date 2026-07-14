@@ -21,6 +21,21 @@ ASCII flow:
   agent_loop uses assembled pool
 """
 
+# 本章目标：在 s18 的完整团队协作框架上，引入 MCP（Model Context Protocol）式的
+# 外部工具接入机制。Agent 不再只能调用代码中预先手写的工具，而是可以先连接 MCP
+# Server、发现其工具，再把这些工具动态加入同一个工具池。
+#
+# 本章核心流程：
+#   1. Lead 先调用内置 connect_mcp 工具连接某个 Server；
+#   2. MCPClient 保存 Server 暴露的工具定义与调用入口；
+#   3. assemble_tool_pool 为外部工具添加 mcp__server__tool 命名空间，
+#      并与原有内置工具、handler 合并；
+#   4. agent_loop 检测到 connect_mcp 已执行后，立即重建工具池和 system prompt；
+#   5. 下一轮模型请求即可直接调用刚发现的 MCP 工具。
+#
+# 教学版的 MCP Server 由本地 Python handler 模拟，不包含真实 stdio/HTTP JSON-RPC、
+# OAuth、重连和权限拦截；但“发现工具 → 组装工具池 → 按统一方式调用”的主链路一致。
+
 import os, subprocess, json, time, random, threading, re
 from pathlib import Path
 from datetime import datetime
@@ -43,7 +58,11 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System ──
+# ═══════════════════════════════════════════════════════════
+# FROM s12-s18 (unchanged): 文件化任务系统与依赖状态
+# ═══════════════════════════════════════════════════════════
+# 任务仍以 JSON 文件持久化，并通过 blockedBy、claim、complete 维护依赖与生命周期。
+# s19 不修改任务调度逻辑；它只是为 Lead 增加新的外部工具来源。
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -139,7 +158,10 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Worktree System ──
+# ═══════════════════════════════════════════════════════════
+# FROM s18 (unchanged): Git Worktree 隔离
+# ═══════════════════════════════════════════════════════════
+# 每个任务仍可绑定独立 worktree，避免多 Agent 同时修改同一工作目录。
 
 WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_DIR.mkdir(exist_ok=True)
@@ -243,7 +265,12 @@ def keep_worktree(name: str) -> str:
     return f"Worktree '{name}' kept for review (branch: wt/{name})"
 
 
-# ── Prompt Assembly ──
+# ═══════════════════════════════════════════════════════════
+# FROM s10-s18 + NEW in s19: System Prompt 动态反映 MCP 连接状态
+# ═══════════════════════════════════════════════════════════
+# 基础 prompt 结构沿用此前章节；s19 新增两类 MCP 信息：
+#   - 告诉模型 connect_mcp 的存在及 mcp__server__tool 命名规则；
+#   - 连接成功后，把当前已连接的 Server 名称写入 prompt。
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -264,13 +291,18 @@ def assemble_system_prompt(context: dict) -> str:
                 PROMPT_SECTIONS["workspace"]]
     if context.get("memories"):
         sections.append(f"Relevant memories:\n{context['memories']}")
+    # mcp_clients 是运行期注册表。连接 Server 后重新组装 prompt，模型就能看到
+    # 当前环境中已经接入了哪些外部能力；未连接时不额外占用 prompt。
     mcp_names = list(mcp_clients.keys())
     if mcp_names:
         sections.append(f"Connected MCP servers: {', '.join(mcp_names)}")
     return "\n\n".join(sections)
 
 
-# ── Basic Tools ──
+# ═══════════════════════════════════════════════════════════
+# FROM s01-s18 (unchanged): 基础文件与 Shell 工具
+# ═══════════════════════════════════════════════════════════
+# 这些工具仍由本进程直接实现，是后面 assemble_tool_pool 中的 builtin 部分。
 
 def safe_path(p: str, cwd: Path = None) -> Path:
     base = cwd or WORKDIR
@@ -310,7 +342,10 @@ def run_write(path: str, content: str, cwd: Path = None) -> str:
         return f"Error: {e}"
 
 
-# ── MessageBus ──
+# ═══════════════════════════════════════════════════════════
+# FROM s15-s18 (unchanged): Agent 消息总线
+# ═══════════════════════════════════════════════════════════
+# Lead 与 Teammate 继续通过各自的 JSONL 邮箱交换普通消息和协议消息。
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -341,7 +376,10 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-# ── Protocol State ──
+# ═══════════════════════════════════════════════════════════
+# FROM s16-s18 (unchanged): 团队协议请求状态
+# ═══════════════════════════════════════════════════════════
+# request_id 用来把 shutdown / plan 请求与异步返回的 response 对应起来。
 
 @dataclass
 class ProtocolState:
@@ -384,7 +422,11 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
     return msgs
 
 
-# ── Autonomous Agent ──
+# ═══════════════════════════════════════════════════════════
+# FROM s17-s18 (unchanged): Teammate 空闲轮询与自主认领
+# ═══════════════════════════════════════════════════════════
+# Teammate 完成当前工作后仍会进入 IDLE：轮询邮箱、主动寻找可认领任务，
+# 收到关机请求或超过空闲时限后结束线程。
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
@@ -432,7 +474,11 @@ def idle_poll(agent_name: str, messages: list,
     return "timeout"
 
 
-# ── Teammate Thread ──
+# ═══════════════════════════════════════════════════════════
+# FROM s15-s18 (unchanged): Teammate 线程与固定子工具集
+# ═══════════════════════════════════════════════════════════
+# 教学版中 MCP 工具只加入 Lead 的动态工具池。Teammate 仍使用下面固定的 8 个工具，
+# 因而不会继承 Lead 新连接的 docs/deploy 工具；真实 Claude Code 会做配置继承。
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     if name in active_teammates:
@@ -497,6 +543,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             return result
 
         messages = [{"role": "user", "content": prompt}]
+        # 这里是 Teammate 的固定工具定义。它没有调用 assemble_tool_pool，
+        # 正是本教学版中“MCP 工具仅 Lead 可用”的代码落点。
         sub_tools = [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object",
@@ -624,7 +672,9 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     return f"Plan submitted ({req_id})"
 
 
-# ── Lead Protocol Tools ──
+# ═══════════════════════════════════════════════════════════
+# FROM s16-s18 (unchanged): Lead 的关机与计划审批工具
+# ═══════════════════════════════════════════════════════════
 
 def run_request_shutdown(teammate: str) -> str:
     req_id = new_request_id()
@@ -655,7 +705,16 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'}"
 
 
-# ── MCP System (s19 new) ──
+# ═══════════════════════════════════════════════════════════
+# NEW in s19: MCP Client、工具发现与统一调用
+# ═══════════════════════════════════════════════════════════
+# MCPClient 位于 Agent/Harness 一侧：
+#   - tools 保存从 Server “发现”到的工具元数据，相当于 tools/list 的结果；
+#   - _handlers 保存教学版的本地实现，相当于 Server 端真正执行工具的入口；
+#   - call_tool 按原始工具名转发参数，相当于一次 tools/call。
+#
+# 真实实现会通过标准传输协议把请求发给独立 MCP Server；这里用 Python 函数模拟，
+# 目的是把重点放在工具发现、注册和 Agent 调用链路上。
 
 class MCPClient:
     """Discovers and calls tools on an MCP server (mock for teaching)."""
@@ -665,11 +724,15 @@ class MCPClient:
         self.tools: list[dict] = []
         self._handlers: dict[str, callable] = {}
 
+    # 教学版把“发现到的定义”和“可执行 handler”一次性注册进客户端。
+    # Agent 后续只依赖统一的 MCPClient 接口，不需要知道工具由谁、用什么语言实现。
     def register(self, tool_defs: list[dict],
                  handlers: dict[str, callable]):
         self.tools = tool_defs
         self._handlers = handlers
 
+    # assemble_tool_pool 生成的外层 handler 最终都会回到这里，使用 Server 内部的
+    # 原始工具名查找实现；异常在协议边界被转换成普通字符串，避免打断 Agent Loop。
     def call_tool(self, tool_name: str, args: dict) -> str:
         handler = self._handlers.get(tool_name)
         if not handler:
@@ -680,16 +743,21 @@ class MCPClient:
             return f"MCP error: {e}"
 
 
+# 已连接 Server 的运行期注册表。connect_mcp 负责写入，工具池与 prompt 负责读取。
 mcp_clients: dict[str, MCPClient] = {}
 
 _DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
 
 
+# Server 名和工具名来自外部，不能直接拼入模型可调用的工具名。
+# 统一替换特殊字符可稳定命名空间，并降低名称冲突或注入特殊分隔符的风险。
 def normalize_mcp_name(name: str) -> str:
     """Replace non [a-zA-Z0-9_-] with underscore."""
     return _DISALLOWED_CHARS.sub('_', name)
 
 
+# 两个 factory 模拟独立 MCP Server。tool_defs 是发现结果，handlers 是服务端实现；
+# description 中的 readOnly/destructive 目前只是教学标注，尚未接入真正的权限拦截。
 def _mock_server_docs():
     client = MCPClient("docs")
     client.register(
@@ -730,12 +798,17 @@ def _mock_server_deploy():
     return client
 
 
+# 教学版的“Server 配置中心”：传入的名称先在这里解析成对应的连接工厂。
+# 真实系统通常还要合并用户、项目、插件、企业策略等多层 MCP 配置。
 MOCK_SERVERS = {
     "docs": _mock_server_docs,
     "deploy": _mock_server_deploy,
 }
 
 
+# connect_mcp 本身仍是一个内置工具：模型必须先有能力调用它，才能发现外部工具。
+# 该函数只完成“连接 + 注册发现结果”；它不会直接修改当前 agent_loop 手中的 tools。
+# 真正让新工具生效的是本轮工具执行结束后，再次调用 assemble_tool_pool。
 def connect_mcp(name: str) -> str:
     if name in mcp_clients:
         return f"MCP server '{name}' already connected"
@@ -743,6 +816,8 @@ def connect_mcp(name: str) -> str:
     if not factory:
         available = ", ".join(MOCK_SERVERS.keys())
         return f"Unknown server '{name}'. Available: {available}"
+    # factory() 在教学版中立即构造客户端并填充工具列表；真实连接通常会在此
+    # 启动子进程或建立远程连接，再发送 tools/list 请求。
     mcp_client = factory()
     mcp_clients[name] = mcp_client
     tool_names = [t["name"] for t in mcp_client.tools]
@@ -751,26 +826,38 @@ def connect_mcp(name: str) -> str:
             f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
 
 
+# 这是 s19 的核心适配层：把来源不同的工具统一转换成 Anthropic tools + handlers。
+# 返回的两个集合按同一个 name 建立对应关系：模型看到 tools 中的 schema，执行阶段
+# 再用同名 key 从 handlers 中找到 Python 调用入口。
 def assemble_tool_pool() -> tuple[list[dict], dict]:
     """Assemble builtin tools + all MCP tools into one pool."""
+    # 必须复制而不是直接修改全局 BUILTIN_*，否则每次重建都会重复追加 MCP 工具。
     tools = list(BUILTIN_TOOLS)
     handlers = dict(BUILTIN_HANDLERS)
     for server_name, mcp_client in mcp_clients.items():
         safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
             safe_tool = normalize_mcp_name(tool_def["name"])
+            # 不同 Server 都可能提供 search/status 等同名工具；双层前缀把来源编码进
+            # 模型可见名称，避免覆盖内置工具或其他 Server 的工具。
             prefixed = f"mcp__{safe_server}__{safe_tool}"
+            # MCP 定义使用 inputSchema；传给 Anthropic API 时转换为 input_schema。
+            # description 原样保留，因此 readOnly/destructive 标注也会展示给模型。
             tools.append({
                 "name": prefixed,
                 "description": tool_def.get("description", ""),
                 "input_schema": tool_def.get("inputSchema", {}),
             })
+            # c、t 通过默认参数绑定当前循环值，避免 Python 闭包的 late binding：
+            # 若直接引用循环变量，所有 lambda 最终可能都调用最后一个 Server/工具。
             handlers[prefixed] = (
                 lambda *, c=mcp_client, t=tool_def["name"], **kw: c.call_tool(t, kw))
     return tools, handlers
 
 
-# ── Lead Worktree Tools ──
+# ═══════════════════════════════════════════════════════════
+# FROM s18 (unchanged): Lead 工具适配函数
+# ═══════════════════════════════════════════════════════════
 
 def run_create_worktree(name: str, task_id: str = "") -> str:
     return create_worktree(name, task_id)
@@ -782,7 +869,10 @@ def run_keep_worktree(name: str) -> str:
     return keep_worktree(name)
 
 
-# ── Basic tool handlers ──
+# ═══════════════════════════════════════════════════════════
+# FROM s12-s18 + NEW in s19: 内置工具 handler 适配层
+# ═══════════════════════════════════════════════════════════
+# 大多数 wrapper 沿用此前章节；run_connect_mcp 将新的连接能力纳入内置 handler 表。
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -834,7 +924,11 @@ def run_connect_mcp(name: str) -> str:
     return connect_mcp(name)
 
 
-# ── Tool Definitions ──
+# ═══════════════════════════════════════════════════════════
+# FROM s01-s18 + NEW in s19: Lead 内置工具定义
+# ═══════════════════════════════════════════════════════════
+# BUILTIN_TOOLS 仍是启动时必定存在的基础能力。s19 只新增 connect_mcp；真正的
+# mcp__docs__* / mcp__deploy__* 不静态写在这里，而由 assemble_tool_pool 动态生成。
 
 BUILTIN_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -921,6 +1015,7 @@ BUILTIN_TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
+    # MCP 的“入口工具”必须是 builtin，否则尚未连接 Server 时模型无从发起连接。
     {"name": "connect_mcp",
      "description": "Connect to an MCP server (docs, deploy) and discover tools.",
      "input_schema": {"type": "object",
@@ -928,6 +1023,8 @@ BUILTIN_TOOLS = [
                       "required": ["name"]}},
 ]
 
+# schema 与执行逻辑分离：模型只接收 BUILTIN_TOOLS，真正调用时再按名称查 handler。
+# assemble_tool_pool 会复制此表，并继续加入动态生成的 MCP handler。
 BUILTIN_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -944,7 +1041,9 @@ BUILTIN_HANDLERS = {
 }
 
 
-# ── Context ──
+# ═══════════════════════════════════════════════════════════
+# FROM s09-s18 (unchanged): 轻量上下文更新
+# ═══════════════════════════════════════════════════════════
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
@@ -957,9 +1056,15 @@ def update_context(context: dict, messages: list) -> dict:
     return {"memories": memories}
 
 
-# ── Agent Loop (s19: dynamic tool pool, no prompt cache) ──
+# ═══════════════════════════════════════════════════════════
+# NEW in s19: 使用动态工具池的 Lead Agent Loop
+# ═══════════════════════════════════════════════════════════
+# 与此前固定 BUILTIN_TOOLS 的循环相比，本章每次进入 agent_loop 都重新组装工具池。
+# 原因是 MCP 连接会在对话进行中改变“模型可调用工具集合”，旧缓存中的 tools/system
+# 无法表达新状态，因此教学版直接取消 prompt cache，优先保证工具列表正确。
 
 def agent_loop(messages: list, context: dict):
+    # 初始时通常只有 builtin；若前一个用户 turn 已连接 Server，这里也会自动带上它们。
     tools, handlers = assemble_tool_pool()
     system = assemble_system_prompt(context)
     while True:
@@ -981,6 +1086,8 @@ def agent_loop(messages: list, context: dict):
             if block.type != "tool_use":
                 continue
             print(f"\033[36m> {block.name}\033[0m")
+            # 内置工具和 MCP 工具已经被组装为同一张 handlers 表，因此执行阶段
+            # 不需要再判断工具来源：mcp__ 前缀工具也走完全相同的分发路径。
             handler = handlers.get(block.name)
             output = handler(**block.input) if handler else "Unknown"
             print(str(output)[:300])
@@ -988,6 +1095,11 @@ def agent_loop(messages: list, context: dict):
                             "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
 
+        # connect_mcp 在本轮执行中只更新 mcp_clients。必须在下一次请求模型前重建：
+        #   tools      —— 让 API 接收到新发现的工具 schema；
+        #   handlers   —— 让工具名能路由到对应 MCPClient；
+        #   system     —— 让模型看到当前已连接 Server。
+        # 若遗漏这一步，连接虽然成功，但当前循环仍拿着旧工具池，模型无法调用新工具。
         if any(b.name == "connect_mcp" for b in response.content
                if b.type == "tool_use"):
             tools, handlers = assemble_tool_pool()
@@ -995,6 +1107,12 @@ def agent_loop(messages: list, context: dict):
             system = assemble_system_prompt(context)
 
 
+# ═══════════════════════════════════════════════════════════
+# FROM s01-s18 (unchanged): 终端多轮对话外循环
+# ═══════════════════════════════════════════════════════════
+# main 负责持续接收用户输入并保存 history；每次 agent_loop 则完成一个用户 turn 内部的
+# “模型响应 → 工具调用 → tool_result → 再次模型响应”循环。MCP 连接会跨 turn 保留在
+# 全局 mcp_clients 中，直到进程退出。
 if __name__ == "__main__":
     print("s19: mcp tools")
     print("Enter a question, press Enter to send. Type q to quit.\n")
