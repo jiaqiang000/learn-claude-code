@@ -24,6 +24,16 @@ ASCII topology:
     ├── .worktrees/ui/    (branch: wt/ui)     ← Task #2
     ├── .tasks/task_xxx.json (worktree: "auth")
     └── .worktrees/events.jsonl
+
+本章阅读主线：
+  1. Lead 先创建任务，再为任务创建独立 worktree；任务 JSON 只记录 worktree 名称。
+  2. 队友认领任务后，根据任务上的 worktree 字段确定 bash/read/write 的执行目录。
+  3. 任务完成与 worktree 收尾是两套独立动作：complete_task 管任务状态，
+     keep_worktree/remove_worktree 管目录与分支，不互相隐式触发。
+  4. create/remove/keep 成功后写入 events.jsonl，留下可审计的生命周期记录。
+
+这里的关键不是再增加一种“任务状态”，而是补上 s15-s17 尚未解决的“在哪个目录工作”：
+任务系统负责分工，MessageBus/协议负责协作，git worktree 负责文件系统与分支隔离。
 """
 
 import os, subprocess, json, time, random, threading, re
@@ -44,11 +54,15 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+# WORKDIR 始终指向启动程序时所在的主仓库目录；各 worktree 都从这里统一创建和管理。
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12 + s18 worktree field) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s12-s17 (unchanged): 任务持久化、依赖检查与生命周期
+# s18 仅在 Task 上增加 worktree 字段，让任务可以“指向”独立目录。
+# ═══════════════════════════════════════════════════════════
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -62,6 +76,8 @@ class Task:
     status: str
     owner: str | None
     blockedBy: list[str]
+    # NEW in s18: 只保存 worktree 名称，不把绝对路径写进任务数据。
+    # 实际目录在使用时统一由 WORKTREES_DIR / worktree 计算，避免两处路径信息不一致。
     worktree: str | None = None      # s18: bound worktree name
 
 
@@ -71,6 +87,7 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """创建 pending 任务；此时尚未被队友认领，也可以稍后再绑定 worktree。"""
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -100,6 +117,7 @@ def get_task_json(task_id: str) -> str:
 
 
 def can_start(task_id: str) -> bool:
+    """只有全部依赖任务存在且已 completed，当前任务才允许被认领。"""
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -110,6 +128,7 @@ def can_start(task_id: str) -> bool:
 
 
 def claim_task(task_id: str, owner: str = "agent") -> str:
+    """认领只推进任务状态；队友工作目录的切换由线程内的工具包装层负责。"""
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
@@ -131,6 +150,7 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 
 
 def complete_task(task_id: str) -> str:
+    """完成任务并报告新解锁的依赖任务；不会自动删除或保留 worktree。"""
     task = load_task(task_id)
     if task.status != "in_progress":
         return f"Task {task_id} is {task.status}, cannot complete"
@@ -145,16 +165,20 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Worktree System (s18 new) ──
+# ═══════════════════════════════════════════════════════════
+# NEW in s18: Worktree 生命周期与 task-worktree 绑定
+# 这一层真正解决并行 Agent 共用目录时相互覆盖文件的问题。
+# ═══════════════════════════════════════════════════════════
 
 WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_DIR.mkdir(exist_ok=True)
 
+# 名称会同时参与目录名和分支名拼接，因此先限制字符集与长度，阻断 ../ 等路径穿越写法。
 VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
 
 
 def validate_worktree_name(name: str) -> str | None:
-    """Return error message if invalid, None if valid."""
+    """校验 worktree 名称。非法时返回错误文本，合法时返回 None。"""
     if not name:
         return "Worktree name cannot be empty"
     if name == "." or name == "..":
@@ -166,7 +190,7 @@ def validate_worktree_name(name: str) -> str | None:
 
 
 def run_git(args: list[str]) -> tuple[bool, str]:
-    """Run git command. Return (ok, output)."""
+    """始终从主仓库执行 git 管理命令，并把成功标志和输出一起交给上层判断。"""
     try:
         r = subprocess.run(["git"] + args, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=30)
@@ -178,7 +202,7 @@ def run_git(args: list[str]) -> tuple[bool, str]:
 
 
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
-    """Append a lifecycle event to events.jsonl."""
+    """追加一条 JSONL 生命周期事件；一行一个事件，便于人工审计和后续扫描。"""
     event = {"type": event_type, "worktree": worktree_name,
              "task_id": task_id, "ts": time.time()}
     events_file = WORKTREES_DIR / "events.jsonl"
@@ -187,13 +211,20 @@ def log_event(event_type: str, worktree_name: str, task_id: str = ""):
 
 
 def create_worktree(name: str, task_id: str = "") -> str:
-    """Create a git worktree with a dedicated branch. Optionally bind to a task."""
+    """
+    为任务创建“独立目录 + 独立分支”，并可选地把目录名称写入任务。
+
+    调用链：Lead tool -> run_create_worktree -> create_worktree -> git worktree add。
+    只有 git 命令成功后才执行任务绑定和事件记录，避免日志声称创建成功而实际目录不存在。
+    """
     err = validate_worktree_name(name)
     if err:
         return f"Error: {err}"
     path = WORKTREES_DIR / name
     if path.exists():
         return f"Worktree '{name}' already exists at {path}"
+
+    # -b wt/<name> 为该目录创建专属分支；HEAD 表示从主仓库当前提交开始。
     ok, result = run_git(["worktree", "add", str(path), "-b", f"wt/{name}", "HEAD"])
     if not ok:
         return f"Git error: {result}"
@@ -205,7 +236,12 @@ def create_worktree(name: str, task_id: str = "") -> str:
 
 
 def bind_task_to_worktree(task_id: str, worktree_name: str):
-    """Write worktree field to task. Keep status as pending for auto-claim."""
+    """
+    只写入 task.worktree，不认领任务、不修改 status。
+
+    这样 Lead 可以提前完成“创建任务 + 准备目录”，任务仍保持 pending；
+    等队友进入 idle 扫描或主动 claim 时，才由 claim_task 推进到 in_progress。
+    """
     task = load_task(task_id)
     task.worktree = worktree_name
     save_task(task)
@@ -213,7 +249,7 @@ def bind_task_to_worktree(task_id: str, worktree_name: str):
 
 
 def _count_worktree_changes(path: Path) -> tuple[int, int]:
-    """Count uncommitted files and commits in a worktree."""
+    """删除前统计未提交文件和未推送提交，为默认拒绝破坏性清理提供依据。"""
     try:
         r1 = subprocess.run(["git", "status", "--porcelain"],
                             cwd=path, capture_output=True, text=True, timeout=10)
@@ -223,11 +259,17 @@ def _count_worktree_changes(path: Path) -> tuple[int, int]:
         commits = len([l for l in r2.stdout.strip().splitlines() if l.strip()])
         return files, commits
     except Exception:
+        # -1 表示无法可靠判断，而不是“没有改动”；上层会因此拒绝默认删除。
         return -1, -1
 
 
 def remove_worktree(name: str, discard_changes: bool = False) -> str:
-    """Remove worktree. Refuses if uncommitted changes unless discard_changes."""
+    """
+    删除 worktree 目录和对应 wt/<name> 分支。
+
+    默认先检查改动；只有调用者显式传入 discard_changes=true 才允许强制丢弃。
+    这里不调用 complete_task，因为“代码目录是否清理”和“任务是否完成”是两个独立决策。
+    """
     err = validate_worktree_name(name)
     if err:
         return err
@@ -244,6 +286,8 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
                     f"and {commits} unpushed commit(s). "
                     "Use discard_changes=true to force removal, "
                     "or keep_worktree to preserve for review.")
+
+    # 先让 git 注销并移除 worktree，再删除专属分支；第一步失败时不写 remove 事件。
     ok1, _ = run_git(["worktree", "remove", str(path), "--force"])
     if not ok1:
         return f"Failed to remove worktree directory for '{name}'"
@@ -254,7 +298,9 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
 
 
 def keep_worktree(name: str) -> str:
-    """Keep worktree for manual review. Branch preserved."""
+    """
+    保留目录和分支供人工 review/merge，仅记录 keep 事件，不做文件系统修改。
+    """
     err = validate_worktree_name(name)
     if err:
         return err
@@ -263,7 +309,10 @@ def keep_worktree(name: str) -> str:
     return f"Worktree '{name}' kept for review (branch: wt/{name})"
 
 
-# ── Prompt Assembly (from s10) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s10-s17 (unchanged): 系统提示词的分段组装与缓存
+# s18 只把三个 worktree 工具名称加入可用工具说明。
+# ═══════════════════════════════════════════════════════════
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -298,9 +347,14 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Basic Tools ──
+# ═══════════════════════════════════════════════════════════
+# FROM s02-s17: 基础文件与 Bash 工具
+# NEW in s18: cwd 参数成为目录隔离的执行入口；不传时仍回到主仓库 WORKDIR。
+# ═══════════════════════════════════════════════════════════
+
 
 def safe_path(p: str, cwd: Path = None) -> Path:
+    """把相对路径限制在当前执行根目录内；根目录可以是主仓库，也可以是某个 worktree。"""
     base = cwd or WORKDIR
     path = (base / p).resolve()
     if not path.is_relative_to(base):
@@ -338,7 +392,10 @@ def run_write(path: str, content: str, cwd: Path = None) -> str:
         return f"Error: {e}"
 
 
-# ── MessageBus (from s15) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s15-s17 (unchanged): 基于 JSONL 邮箱的 MessageBus
+# 它负责 Agent 间传消息，不负责代码目录隔离。
+# ═══════════════════════════════════════════════════════════
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -357,6 +414,7 @@ class MessageBus:
               f"({msg_type}) {content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
+        """一次性读取并删除邮箱文件，表示这些消息已被当前消费者取走。"""
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
@@ -369,7 +427,11 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-# ── Protocol State (from s16) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s16-s17 (unchanged): shutdown / plan approval 协议状态
+# request_id 用来把异步响应匹配回原始请求。
+# ═══════════════════════════════════════════════════════════
+
 
 @dataclass
 class ProtocolState:
@@ -410,6 +472,7 @@ def match_response(response_type: str, request_id: str, approve: bool):
 
 
 def consume_lead_inbox(route_protocol=True) -> list[dict]:
+    """统一消费 Lead 邮箱：先路由协议响应，再把原始消息返回给工具或主循环展示。"""
     msgs = BUS.read_inbox("lead")
     if route_protocol:
         for msg in msgs:
@@ -421,14 +484,17 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
     return msgs
 
 
-# ── Autonomous Agent (from s17, + worktree cwd) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s17: 自治队友的 WORK / IDLE 循环与自动认领
+# NEW in s18: 自动认领消息会附带任务绑定的 worktree 路径。
+# ═══════════════════════════════════════════════════════════
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks() -> list[dict]:
-    """Find pending, unowned tasks with all dependencies completed."""
+    """寻找 pending、无 owner 且依赖已满足的任务，供 idle 队友自动认领。"""
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
         task = json.loads(f.read_text())
@@ -441,10 +507,11 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 def idle_poll(agent_name: str, messages: list,
               name: str, role: str) -> str:
-    """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
+    """空闲期轮询消息和可认领任务，返回 work、shutdown 或 timeout。"""
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
 
+        # 空闲阶段也必须先处理 shutdown，否则队友没有新的模型调用时会无法退出。
         inbox = BUS.read_inbox(agent_name)
         if inbox:
             for msg in inbox:
@@ -471,6 +538,9 @@ def idle_poll(agent_name: str, messages: list,
                 if task_data.get("worktree"):
                     wt_path = WORKTREES_DIR / task_data["worktree"]
                     wt_info = f"\nWork directory: {wt_path}"
+
+                # idle_poll 位于线程内 wt_ctx 之外，因此这里把目录信息注入消息，交给后续 WORK 阶段。
+                # 下方 _run_claim_task 才是显式认领时直接更新工具 cwd 的路径。
                 messages.append({"role": "user",
                     "content": f"<auto-claimed>Task {task_data['id']}: "
                                f"{task_data['subject']}{wt_info}</auto-claimed>"})
@@ -484,9 +554,19 @@ def idle_poll(agent_name: str, messages: list,
     return "timeout"
 
 
-# ── Teammate Thread (from s15 + s16 + s17 + s18) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s15-s17: 队友线程、消息处理、工具循环与自治轮询
+# NEW in s18: 每个队友线程维护自己的 wt_ctx，并用它包装 bash/read/write。
+# ═══════════════════════════════════════════════════════════
+
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    """
+    启动一个自治队友线程。
+
+    每次调用都会创建独立的 run 闭包，因此 messages、wt_ctx 和工具包装函数都属于该队友；
+    Alice 修改自己的 wt_ctx 不会改变 Bob 的工具执行目录。
+    """
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
@@ -496,6 +576,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
               f"If a task has a worktree, work in that directory.")
 
     def handle_inbox_message(name: str, msg: dict, messages: list):
+        """在队友的 WORK 阶段消费协议消息；返回 True 表示应结束线程。"""
         msg_type = msg.get("type", "message")
         meta = msg.get("metadata", {})
         req_id = meta.get("request_id", "")
@@ -519,13 +600,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return False
 
     def run():
-        # Track current worktree for this teammate's cwd
+        # NEW in s18: 当前队友的目录上下文。使用可变 dict，便于多个内层函数共享并更新路径。
         wt_ctx = {"path": None}
 
         def _wt_cwd() -> Path | None:
             p = wt_ctx["path"]
             return Path(p) if p else None
 
+        # 三个包装器是目录隔离真正落到工具执行层的位置：
+        # 相同的相对路径 config.py，会分别解析到各自 worktree 内，而不是共同写入主仓库。
         def _run_bash(command: str) -> str:
             return run_bash(command, cwd=_wt_cwd())
 
@@ -545,9 +628,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 for t in tasks)
 
         def _run_claim_task(task_id: str):
+            """先走统一任务认领，再根据持久化的 worktree 字段切换该队友的工具 cwd。"""
             result = claim_task(task_id, owner=name)
             if "Claimed" in result:
-                # Set worktree cwd if task has one
                 task = load_task(task_id)
                 if task.worktree:
                     wt_ctx["path"] = str(WORKTREES_DIR / task.worktree)
@@ -556,11 +639,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             return result
 
         def _run_complete_task(task_id: str):
+            """任务完成后清空当前 cwd；worktree 本身仍等待 Lead 决定 keep 或 remove。"""
             result = complete_task(task_id)
             wt_ctx["path"] = None
             return result
 
         messages = [{"role": "user", "content": prompt}]
+
+        # sub_tools 只描述“模型可以调用什么以及参数格式”，并不直接执行 Python 函数。
         sub_tools = [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object",
@@ -602,6 +688,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                               "required": ["task_id"]}},
         ]
 
+        # sub_handlers 才是“工具名 -> 实际 Python 函数”的执行映射。
+        # bash/read/write 指向上面的 worktree 包装器，而不是直接指向全局基础函数。
         sub_handlers = {
             "bash": _run_bash, "read_file": _run_read,
             "write_file": _run_write,
@@ -613,14 +701,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             "complete_task": _run_complete_task,
         }
 
-        # Outer loop: WORK → IDLE cycle
+        # FROM s17: 外层负责在有工作时运行模型，无工作时进入轮询；二者循环切换。
         while True:
             if len(messages) <= 3:
                 messages.insert(0, {"role": "user",
                     "content": f"<identity>You are '{name}', role: {role}. "
                                f"Continue your work.</identity>"})
 
-            # WORK phase
+            # WORK phase：最多连续执行 10 轮“模型响应 -> 工具执行 -> tool_result 回填”。
             should_shutdown = False
             for _ in range(10):
                 inbox = BUS.read_inbox(name)
@@ -660,14 +748,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             if should_shutdown:
                 break
 
-            # IDLE phase
+            # IDLE phase：不调用模型，低成本等待新消息或可认领任务。
             idle_result = idle_poll(name, messages, name, role)
             if idle_result == "shutdown":
                 break
             if idle_result == "timeout":
                 break
 
-        # Summary
+        # 线程结束时提取最近一条文本作为结果，经 MessageBus 返回 Lead。
         summary = "Done."
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
@@ -700,7 +788,10 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     return f"Plan submitted ({req_id}). Waiting for approval..."
 
 
-# ── Lead Protocol Tools (from s16) ──
+# ═══════════════════════════════════════════════════════════
+# FROM s16-s17 (unchanged): Lead 的 shutdown 与 plan approval 工具
+# ═══════════════════════════════════════════════════════════
+
 
 def run_request_shutdown(teammate: str) -> str:
     req_id = new_request_id()
@@ -739,7 +830,11 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
 
-# ── Lead Worktree Tools (s18 new) ──
+# ═══════════════════════════════════════════════════════════
+# NEW in s18: Lead 的 Worktree 工具适配层
+# 这三个薄包装把统一工具处理器连接到上面的领域函数，避免在 Agent Loop 中写分支判断。
+# ═══════════════════════════════════════════════════════════
+
 
 def run_create_worktree(name: str, task_id: str = "") -> str:
     return create_worktree(name, task_id)
@@ -753,7 +848,11 @@ def run_keep_worktree(name: str) -> str:
     return keep_worktree(name)
 
 
-# ── Basic tool handlers ──
+# ═══════════════════════════════════════════════════════════
+# FROM s12-s17 (unchanged): 其他 Lead 工具的适配函数
+# 列表展示在 s18 中补充 worktree 名称，方便 Lead 看出任务与目录的绑定关系。
+# ═══════════════════════════════════════════════════════════
+
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -807,7 +906,10 @@ def run_check_inbox() -> str:
     return "\n".join(lines)
 
 
-# ── Tool Definitions ──
+# ═══════════════════════════════════════════════════════════
+# FROM s02-s17: Lead 可见工具的 JSON Schema
+# NEW in s18: 增加 create/remove/keep_worktree；这里只定义调用契约，不执行逻辑。
+# ═══════════════════════════════════════════════════════════
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -885,7 +987,7 @@ TOOLS = [
                           "approve": {"type": "boolean"},
                           "feedback": {"type": "string"}},
                       "required": ["request_id", "approve"]}},
-    # s18 new: worktree tools
+    # NEW in s18: worktree 生命周期工具对 Lead 可见。
     {"name": "create_worktree",
      "description": "Create an isolated git worktree with its own branch.",
      "input_schema": {"type": "object",
@@ -905,6 +1007,8 @@ TOOLS = [
                       "required": ["name"]}},
 ]
 
+# 工具调用的完整落地链：模型返回 block.name -> 查表 -> handler(**block.input) -> tool_result。
+# 因此仅把 schema 加入 TOOLS 还不够，必须同时在这里注册实际处理函数。
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -920,7 +1024,9 @@ TOOL_HANDLERS = {
 }
 
 
-# ── Context ──
+# ═══════════════════════════════════════════════════════════
+# FROM s09-s17 (unchanged): 从本地记忆文件刷新动态上下文
+# ═══════════════════════════════════════════════════════════
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
@@ -933,7 +1039,11 @@ def update_context(context: dict, messages: list) -> dict:
     return {"memories": memories}
 
 
-# ── Agent Loop ──
+# ═══════════════════════════════════════════════════════════
+# FROM s01-s17: Lead 的 Agent Loop
+# s18 没有另起一套循环，只是把 worktree 工具注册进原有 tool_use 分发链。
+# ═══════════════════════════════════════════════════════════
+
 
 def agent_loop(messages: list, context: dict):
     system = get_system_prompt(context)
@@ -961,10 +1071,17 @@ def agent_loop(messages: list, context: dict):
             print(str(output)[:300])
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
+
+        # 工具结果以 user/tool_result 形式回填，下一轮模型才能看到创建目录、绑定或删除的结果。
         messages.append({"role": "user", "content": results})
         context = update_context(context, messages)
         system = get_system_prompt(context)
 
+
+# ═══════════════════════════════════════════════════════════
+# FROM s01-s17: 终端多轮对话入口
+# s18 延续主循环，并在每轮后统一消费 Lead 邮箱，把队友结果注入下一轮历史。
+# ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("s18: worktree isolation")
@@ -987,7 +1104,8 @@ if __name__ == "__main__":
             elif isinstance(block, dict) and block.get("type") == "text":
                 print(block.get("text", ""))
 
-        # Consume lead inbox: route protocol + inject into history
+        # Lead 邮箱既可能包含普通结果，也可能包含 shutdown/plan 等协议响应。
+        # consume_lead_inbox 先更新 pending_requests，再把消息文本放入 history，供下一轮模型读取。
         inbox = consume_lead_inbox(route_protocol=True)
         if inbox:
             inbox_text = "\n".join(
