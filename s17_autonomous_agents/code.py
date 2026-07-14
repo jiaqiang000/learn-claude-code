@@ -19,6 +19,11 @@ ASCII lifecycle:
   IDLE: 5s poll → inbox? → WORK / unclaimed? → claim → WORK / 60s? → SHUTDOWN
 """
 
+# 本章目标：让队友不再依赖 Lead 逐个分配任务，而是在空闲时自行扫描任务板、
+# 自动认领满足依赖条件的任务，并在 WORK 与 IDLE 两个阶段之间循环。
+# 整体流程：Lead 创建任务并启动队友 → 队友 WORK 执行 → IDLE 检查消息/任务板
+# → 有新工作则回到 WORK → 连续 60 秒无工作或收到关机请求后汇报并退出。
+
 import os, subprocess, json, time, random, threading
 from pathlib import Path
 from datetime import datetime
@@ -40,6 +45,12 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+
+# ═══════════════════════════════════════════════════════════
+# FROM s12 (unchanged): 文件任务板与依赖关系
+# ═══════════════════════════════════════════════════════════
+# 每个任务保存为 .tasks/task_*.json。s17 沿用这套持久化模型，新增的自治能力
+# 只是主动读取并认领任务板中的任务，并没有重新设计任务数据结构。
 
 # ── Task System (from s12) ──
 
@@ -92,6 +103,8 @@ def get_task(task_id: str) -> str:
 
 
 def can_start(task_id: str) -> bool:
+    # blockedBy 不必为空；只要其中每个前置任务都已 completed，当前任务即可启动。
+    # 这也是后面 scan_unclaimed_tasks 判断“任务是否可认领”的统一入口。
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -101,10 +114,16 @@ def can_start(task_id: str) -> bool:
     return True
 
 
+# ═══════════════════════════════════════════════════════════
+# NEW in s17: 认领时检查 owner，降低多个队友抢同一任务的覆盖风险
+# ═══════════════════════════════════════════════════════════
+
 def claim_task(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
+    # 自治队友会并发扫描同一任务板，因此写入 owner 前必须再次检查。
+    # 教学版仍没有文件锁，这只能避免明显的重复覆盖，不能完全消除并发竞态。
     if task.owner:
         return f"Task {task_id} already owned by {task.owner}"
     if not can_start(task_id):
@@ -128,6 +147,8 @@ def complete_task(task_id: str) -> str:
         return f"Task {task_id} is {task.status}, cannot complete"
     task.status = "completed"
     save_task(task)
+    # 当前任务完成后重新检查任务板，用于提示哪些依赖任务刚刚被解锁。
+    # 真正的后续认领仍由队友下一次进入 IDLE 时完成。
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
     print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
@@ -136,6 +157,10 @@ def complete_task(task_id: str) -> str:
         msg += f"\nUnblocked: {', '.join(unblocked)}"
     return msg
 
+
+# ═══════════════════════════════════════════════════════════
+# FROM s10 (unchanged): System Prompt 分段组装与缓存
+# ═══════════════════════════════════════════════════════════
 
 # ── Prompt Assembly (from s10) ──
 
@@ -170,6 +195,10 @@ def get_system_prompt(context: dict) -> str:
     _last_context_hash, _last_prompt = h, assemble_system_prompt(context)
     return _last_prompt
 
+
+# ═══════════════════════════════════════════════════════════
+# FROM s15 (unchanged): 基础文件/命令工具
+# ═══════════════════════════════════════════════════════════
 
 # ── Tools (from s15) ──
 
@@ -210,6 +239,12 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
+# ═══════════════════════════════════════════════════════════
+# FROM s15 (unchanged): 基于 JSONL 邮箱文件的 MessageBus
+# ═══════════════════════════════════════════════════════════
+# send 负责追加消息，read_inbox 读取后删除邮箱文件，因此消息只会被消费一次。
+# s17 的自治循环正是通过周期性调用 read_inbox 感知 Lead 的新消息和关机协议。
+
 # ── MessageBus (from s15) ──
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
@@ -241,6 +276,10 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
+
+# ═══════════════════════════════════════════════════════════
+# FROM s16 (unchanged): 请求-响应协议状态与 request_id 关联
+# ═══════════════════════════════════════════════════════════
 
 # ── Protocol State (from s16) ──
 
@@ -283,6 +322,12 @@ def match_response(response_type: str, request_id: str, approve: bool):
           f"({request_id}: {state.status})\033[0m")
 
 
+# ═══════════════════════════════════════════════════════════
+# NEW in s17: 空闲轮询与任务自动发现
+# ═══════════════════════════════════════════════════════════
+# 这部分把“做完当前任务就退出”改为“先进入 IDLE 等待新工作”。队友每 5 秒
+# 检查一次，最多检查 12 次：优先处理 inbox，再扫描任务板；两者都没有才继续等。
+
 # ── Autonomous Agent (s17 new) ──
 
 IDLE_POLL_INTERVAL = 5   # seconds
@@ -291,6 +336,8 @@ IDLE_TIMEOUT = 60         # seconds
 
 def scan_unclaimed_tasks() -> list[dict]:
     """Find pending, unowned tasks with all dependencies completed."""
+    # “可认领”必须同时满足：仍为 pending、没有 owner、blockedBy 已全部完成。
+    # 按文件名排序是教学版的确定性策略，后面 idle_poll 只尝试列表中的第一个任务。
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
         task = json.loads(f.read_text())
@@ -303,10 +350,13 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 def idle_poll(name: str, messages: list, role: str) -> str:
     """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
+    # 返回值交给外层生命周期循环解释：
+    # work 表示发现新工作并回到 WORK；shutdown/timeout 表示结束队友线程。
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
 
         # Check inbox — dispatch protocol messages first
+        # inbox 优先于任务板，因为其中可能含有必须立即处理的 shutdown_request。
         inbox = BUS.read_inbox(name)
         if inbox:
             # Check for shutdown_request
@@ -321,6 +371,7 @@ def idle_poll(name: str, messages: list, role: str) -> str:
                     return "shutdown"
 
             # Non-protocol inbox: inject and resume work
+            # 普通消息写回 messages，使下一轮 LLM 调用能够看到消息内容并继续工作。
             messages.append({"role": "user",
                 "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
             print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
@@ -330,8 +381,11 @@ def idle_poll(name: str, messages: list, role: str) -> str:
         unclaimed = scan_unclaimed_tasks()
         if unclaimed:
             task = unclaimed[0]
+            # “扫描到”与“成功认领”不是同一件事：两个队友可能同时看到同一任务，
+            # 所以必须检查 claim_task 的返回结果，失败时继续下一轮轮询。
             result = claim_task(task["id"], name)
             if "Claimed" in result:
+                # 将自动认领结果注入对话，告诉 LLM 下一轮 WORK 具体要处理哪个任务。
                 messages.append({"role": "user",
                     "content": f"<auto-claimed>Task {task['id']}: "
                                f"{task['subject']}</auto-claimed>"})
@@ -344,6 +398,13 @@ def idle_poll(name: str, messages: list, role: str) -> str:
     print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
     return "timeout"
 
+
+# ═══════════════════════════════════════════════════════════
+# NEW in s17: 队友生命周期由单次 WORK 扩展为 WORK → IDLE 循环
+# ═══════════════════════════════════════════════════════════
+# s15 提供线程队友，s16 提供协议处理；s17 在两者外面增加自治循环和任务工具。
+# 重点看 run() 中的外层 while True：内层最多 10 轮工具调用构成一次 WORK，
+# WORK 结束后进入 idle_poll；发现消息/任务再回到下一轮 WORK，否则退出。
 
 # ── Teammate Thread (from s15 + s16 + s17) ──
 
@@ -358,6 +419,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
     def handle_inbox_message(name: str, msg: dict, messages: list):
         """Dispatch incoming protocol messages by type."""
+        # WORK 阶段的协议入口。IDLE 阶段没有调用本函数，而是在 idle_poll 中
+        # 直接处理 shutdown_request，保证无论处于哪一阶段都能优雅关机。
         msg_type = msg.get("type", "message")
         meta = msg.get("metadata", {})
         req_id = meta.get("request_id", "")
@@ -408,6 +471,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                               "properties": {"plan": {"type": "string"}},
                               "required": ["plan"]}},
             # s17 new: teammates can list, claim, and complete tasks
+            # 之前队友只能被动接收 Lead 的工作；这三个工具让它能够查看、认领并闭环任务。
             {"name": "list_tasks",
              "description": "List all tasks on the board.",
              "input_schema": {"type": "object", "properties": {},
@@ -433,6 +497,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 for t in tasks)
 
         def _run_claim_task(task_id: str):
+            # 将当前队友名写入 owner，任务板才能反映任务究竟被谁认领。
             return claim_task(task_id, owner=name)
 
         def _run_complete_task(task_id: str):
@@ -449,8 +514,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         }
 
         # Outer loop: WORK → IDLE cycle
+        # 外层循环是 s17 的主干：一次循环包含一个 WORK 阶段和一个 IDLE 阶段。
         while True:
             # Identity re-injection (s17)
+            # 教学版压缩上下文后 messages 可能只剩很少内容，因此在新 WORK 开始前
+            # 重新注入姓名和角色，避免队友忘记自身身份。真实实现会保留 system prompt。
             if len(messages) <= 3:
                 messages.insert(0, {"role": "user",
                     "content": f"<identity>You are '{name}', role: {role}. "
@@ -458,6 +526,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
             # WORK phase
             should_shutdown = False
+            # 内层最多进行 10 轮“LLM → tool_use → tool_result”，防止单次 WORK 无限循环。
             for _ in range(10):
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
@@ -481,6 +550,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 except Exception:
                     break
                 messages.append({"role": "assistant", "content": response.content})
+                # 不再请求工具代表这一轮 WORK 已完成；此处不是直接退出线程，而是转入 IDLE。
                 if response.stop_reason != "tool_use":
                     break
                 results = []
@@ -497,6 +567,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 break
 
             # IDLE phase (s17 new)
+            # idle_poll 的 work 会自然进入下一次 while True，从而再次开始 WORK。
             idle_result = idle_poll(name, messages, role)
             if idle_result == "shutdown":
                 break
@@ -504,6 +575,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 break
 
         # Summary
+        # 无论因关机请求还是空闲超时退出，最终都从历史中提取最近文本结果发给 Lead。
         summary = "Done."
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
@@ -519,6 +591,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         print(f"  \033[32m[teammate] {name} finished\033[0m")
 
     active_teammates[name] = True
+    # daemon=True 表示主程序结束时不必等待队友线程；队友自己的正常退出仍由上面的生命周期控制。
     threading.Thread(target=run, daemon=True).start()
     print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
     return f"Teammate '{name}' spawned as {role} (autonomous)"
@@ -536,6 +609,10 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
              {"request_id": req_id})
     return f"Plan submitted ({req_id}). Waiting for approval..."
 
+
+# ═══════════════════════════════════════════════════════════
+# FROM s16 (unchanged): Lead 发起关机与计划审批协议
+# ═══════════════════════════════════════════════════════════
 
 # ── Lead Protocol Tools (from s16) ──
 
@@ -577,6 +654,10 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
 
+# ═══════════════════════════════════════════════════════════
+# FROM s12-s16 (unchanged): Lead 侧工具处理函数
+# ═══════════════════════════════════════════════════════════
+
 # ── Basic tool handlers ──
 
 def run_create_task(subject: str, description: str = "",
@@ -617,6 +698,12 @@ def run_send_message(to: str, content: str) -> str:
     return f"Sent to {to}"
 
 
+# ═══════════════════════════════════════════════════════════
+# NEW in s17: Lead 收件箱统一消费
+# ═══════════════════════════════════════════════════════════
+# 过去检查 inbox 与主循环结束后的消费容易形成两套路径。现在统一先读取一次消息，
+# 可选地路由协议 response 更新 pending_requests，然后把同一批消息返回给调用方。
+
 def consume_lead_inbox(route_protocol=True) -> list[dict]:
     """Read Lead inbox: route protocol responses, return all messages."""
     msgs = BUS.read_inbox("lead")
@@ -631,6 +718,7 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
 
 
 def run_check_inbox() -> str:
+    # 工具调用和主循环都复用 consume_lead_inbox，避免协议消息只被打印而未更新状态。
     msgs = consume_lead_inbox(route_protocol=True)
     if not msgs:
         return "(inbox empty)"
@@ -642,6 +730,10 @@ def run_check_inbox() -> str:
         lines.append(f"  [{m['from']}]{tag} {m['content'][:200]}")
     return "\n".join(lines)
 
+
+# ═══════════════════════════════════════════════════════════
+# FROM s10-s16 (unchanged): Lead 工具定义与名称到处理函数的映射
+# ═══════════════════════════════════════════════════════════
 
 # ── Tool Definitions ──
 
@@ -735,6 +827,10 @@ TOOL_HANDLERS = {
 }
 
 
+# ═══════════════════════════════════════════════════════════
+# FROM s08-s10 (unchanged): 读取记忆并刷新上下文
+# ═══════════════════════════════════════════════════════════
+
 # ── Context ──
 
 MEMORY_DIR = WORKDIR / ".memory"
@@ -747,6 +843,11 @@ def update_context(context: dict, messages: list) -> dict:
         memories = MEMORY_INDEX.read_text()[:2000]
     return {"memories": memories}
 
+
+# ═══════════════════════════════════════════════════════════
+# FROM s01-s16 (unchanged): Lead 的标准工具调用循环
+# ═══════════════════════════════════════════════════════════
+# s17 的自治主要发生在队友线程中；Lead 仍按“调用模型→执行工具→回填结果”的方式运行。
 
 # ── Agent Loop ──
 
@@ -803,6 +904,8 @@ if __name__ == "__main__":
                 print(block.get("text", ""))
 
         # Consume lead inbox: route protocol + inject into history
+        # 这里不仅打印队友结果，还把消息写入 Lead 的 history。这样下一次用户 turn 中，
+        # Lead 的 LLM 可以看到队友 summary/result，并据此继续协调，而不是丢失消息。
         inbox = consume_lead_inbox(route_protocol=True)
         if inbox:
             inbox_text = "\n".join(
